@@ -1,0 +1,51 @@
+# Claude Code internals
+.claude/
+CLAUDE.md
+
+# Data directories (never commit raw or processed data)
+data/raw/
+data/processed/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment variables
+.env
+.env.*
+
+# OS / editor junk
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Ruff
+.ruff_cache/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
