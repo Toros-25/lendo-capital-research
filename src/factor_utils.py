@@ -1,8 +1,9 @@
 """
-Factor construction utilities for Week 2.
+Factor construction utilities for Week 2 and beyond.
 
-This module builds value and momentum signals — and eventually quintile
-portfolios — on top of the cleaned OHLCV data from data_utils.py.
+This module builds value and momentum signals, quintile portfolios, and
+(Week 5) quintile weight histories — all on top of the cleaned OHLCV data
+from data_utils.py.
 
 IMPORTANT — PROXY NATURE OF THE VALUE SIGNAL
 ---------------------------------------------
@@ -50,6 +51,39 @@ form_quintile_portfolios(df, signal_col, ret_col)
     Q1 = lowest signal = least desirable. Dates with no valid ret_col are
     excluded with a logged reason. Returns tidy (date, quintile,
     portfolio_return, n_holdings).
+
+compute_quintile_weights(df, signal_col, rebalance_dates)
+    Week 5 addition. Returns per-rebalance-date weight vectors for Q1–Q5
+    and a dollar-neutral long-short portfolio, using the identical sorting
+    logic as form_quintile_portfolios. Feeds directly into
+    backtest.compute_turnover().
+
+compute_sector_neutral_score(scores_df, signal_col, sector_map)
+    Week 5 addition. Returns the same score DataFrame with a new
+    ``{signal_col}_sector_neutral`` column containing the within-sector
+    percentile rank (rank(pct=True, ascending=True), where 1.0 = highest
+    signal = Q5-worthy). SPY and tickers absent from sector_map are dropped.
+    Sorted by (date, ticker).
+
+compute_value_score_n(df, lookback_months)
+    Week 5 addition. Thin wrapper around compute_value_score with an
+    explicit (required) lookback_months argument and no default.
+    lookback_months=12 reproduces compute_value_score output exactly.
+
+compute_momentum_score_n(df, lookback_months)
+    Week 5 addition. Thin wrapper around compute_momentum_score with an
+    explicit lookback_months argument and skip_months fixed at 1.
+    lookback_months=12 reproduces compute_momentum_score output exactly.
+
+get_rebalance_dates_freq(df, freq)
+    Week 5 addition. Returns rebalance dates at "weekly" (last trading day
+    on or before each Friday), "monthly" (identical to get_rebalance_dates),
+    or "quarterly" (last trading day of each calendar quarter).
+
+form_ntile_portfolios(df, signal_col, ret_col, n_groups)
+    Week 5 addition. Generalizes form_quintile_portfolios to n_groups
+    portfolio groups. n_groups=5 reproduces form_quintile_portfolios exactly.
+    Columns: date, group, portfolio_return, n_holdings.
 """
 
 from __future__ import annotations
@@ -719,3 +753,356 @@ def compute_spread_series(
     spread = wide[long_q] - wide[short_q]
     spread.name = f"Q{long_q}_minus_Q{short_q}"
     return spread.sort_index()
+
+
+def compute_quintile_weights(
+    df: pd.DataFrame,
+    signal_col: str,
+    rebalance_dates: pd.DatetimeIndex,
+) -> dict[str, dict]:
+    """
+    Build equal-weighted quintile weight vectors at each rebalance date.
+
+    Uses the identical quintile-formation logic as ``form_quintile_portfolios``:
+    tickers are sorted descending by ``signal_col`` at each date and split by
+    rank position via ``np.array_split``. Q5 = highest signal = most desirable;
+    Q1 = lowest signal = least desirable. Feeds directly into
+    ``backtest.compute_turnover()``.
+
+    LOOK-AHEAD NOTE
+    ~~~~~~~~~~~~~~~
+    Weights at date t are formed from the signal observed AT date t —
+    identical to ``form_quintile_portfolios``. The signal itself is already
+    formed without look-ahead (value uses prices through t; momentum uses
+    prices through t-1). This function introduces no additional look-ahead.
+
+    LONG-SHORT PORTFOLIO
+    ~~~~~~~~~~~~~~~~~~~~
+    The ``"long_short"`` key returns a dollar-neutral portfolio:
+      - Q5 tickers each carry weight ``+1 / n_Q5`` (gross long exposure = +1)
+      - Q1 tickers each carry weight ``-1 / n_Q1`` (gross short exposure = -1)
+      - Net weight sum = 0.0 (dollar-neutral)
+
+    BUCKET SIZES AND INSERTION ORDER
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    Identical to ``form_quintile_portfolios``: n=51 → [11, 10, 10, 10, 10];
+    n=50 → [10, 10, 10, 10, 10]. Q5 receives the extra ticker when n is not
+    divisible by 5.
+
+    Dict keys within each quintile are in **descending signal rank order**
+    (Python 3.7+ dict insertion order is preserved from the sorted_grp
+    iteration). Q5 key[0] = highest-signal ticker; Q1 key[0] = lowest.
+
+    Parameters
+    ----------
+    df:
+        Tidy DataFrame with at least columns ``date``, ``ticker``, and
+        ``signal_col``. Typically the direct output of ``compute_value_score``
+        or ``compute_momentum_score``. Rows with NaN ``signal_col`` are
+        dropped before ranking.
+    signal_col:
+        Column to rank and sort by (e.g. ``"value_score_proxy"`` or
+        ``"momentum_score"``).
+    rebalance_dates:
+        Date grid from ``get_rebalance_dates()``. Only dates present in both
+        ``rebalance_dates`` and ``df`` are processed — dates absent from
+        ``df`` (e.g. PLTR's first excluded date) are silently skipped.
+
+    Returns
+    -------
+    dict mapping quintile label → weight_history.
+
+    Keys: ``"Q1"``, ``"Q2"``, ``"Q3"``, ``"Q4"``, ``"Q5"``, ``"long_short"``.
+
+    Each weight_history is a dict:
+        ``{rebalance_date (pd.Timestamp): {ticker (str): weight (float)}}``
+
+    Weights within Q1–Q5 sum to 1.0 at every date.
+    Long-short net weights sum to 0.0 at every date.
+    The weight_history dicts are sorted chronologically and can be passed
+    directly to ``backtest.compute_turnover()``.
+    """
+    working = df.dropna(subset=[signal_col]).copy()
+    working = working[working["date"].isin(rebalance_dates)]
+
+    result: dict[str, dict] = {
+        "Q1": {}, "Q2": {}, "Q3": {}, "Q4": {}, "Q5": {}, "long_short": {},
+    }
+
+    for date, grp in working.groupby("date"):
+        sorted_grp = (
+            grp.sort_values(signal_col, ascending=False)
+            .reset_index(drop=True)
+        )
+        n = len(sorted_grp)
+        tickers = sorted_grp["ticker"].tolist()
+
+        # Split by rank position — identical to form_quintile_portfolios.
+        # position_splits[0] = highest-signal positions → Q5.
+        position_splits = np.array_split(np.arange(n), 5)
+
+        q1_weights: dict[str, float] = {}
+        q5_weights: dict[str, float] = {}
+
+        for q_idx, positions in enumerate(position_splits):
+            quintile = 5 - q_idx  # first split → Q5
+            q_label = f"Q{quintile}"
+            q_tickers = [tickers[i] for i in positions]
+
+            if len(q_tickers) == 0:
+                logger.warning(
+                    "compute_quintile_weights: empty quintile %s at %s — "
+                    "universe may be too small",
+                    q_label, date,
+                )
+                result[q_label][date] = {}
+                continue
+
+            w = 1.0 / len(q_tickers)
+            weights = {t: w for t in q_tickers}
+            result[q_label][date] = weights
+
+            if quintile == 1:
+                q1_weights = weights
+            elif quintile == 5:
+                q5_weights = weights
+
+        # Long-short: long Q5 at uniform +1/n_Q5, short Q1 at uniform -1/n_Q1.
+        # A ticker that appears in both Q1 and Q5 (impossible by construction —
+        # the quintiles are exhaustive and disjoint) would see weights summed;
+        # the guard `.get(t, 0.0)` is there for defensive completeness only.
+        ls_weights: dict[str, float] = {}
+        for t, w in q5_weights.items():
+            ls_weights[t] = ls_weights.get(t, 0.0) + w
+        for t, w in q1_weights.items():
+            ls_weights[t] = ls_weights.get(t, 0.0) - w
+        result["long_short"][date] = ls_weights
+
+    n_dates = len(result["Q5"])
+    logger.info(
+        "compute_quintile_weights: %d rebalance dates processed, signal='%s'",
+        n_dates,
+        signal_col,
+    )
+    return result
+
+
+def compute_sector_neutral_score(
+    scores_df: pd.DataFrame,
+    signal_col: str,
+    sector_map: dict[str, str],
+) -> pd.DataFrame:
+    """
+    Add a within-sector percentile rank as a sector-neutral signal column.
+
+    For each (date, sector) group the tickers are ranked by ``signal_col``
+    using ``rank(pct=True, method="average", ascending=True)``.  A rank of
+    1.0 means the ticker has the *highest* signal within its sector; 0.0 the
+    lowest.  The resulting column is named ``{signal_col}_sector_neutral`` and
+    can be passed directly to ``form_quintile_portfolios`` as a new signal.
+
+    Tickers absent from ``sector_map`` (notably SPY) are dropped before
+    ranking via a ``dropna(subset=["_sector"])``.  The returned DataFrame has
+    the same schema as ``scores_df`` (minus the SPY rows) plus one additional
+    column, sorted by (date, ticker).
+
+    Parameters
+    ----------
+    scores_df   : DataFrame with at minimum ``date``, ``ticker``, and
+                  ``signal_col`` columns — as returned by
+                  ``compute_value_score`` or ``compute_momentum_score``.
+    signal_col  : column to neutralize (e.g. ``"value_score_proxy"``).
+    sector_map  : ``{ticker: sector}`` mapping returned by
+                  ``universe.get_sector_map()``.  SPY should already be
+                  excluded from this dict.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same schema as ``scores_df`` plus column
+        ``{signal_col}_sector_neutral`` (float in (0, 1]).
+        Sorted by (date, ticker), index reset.
+    """
+    out = scores_df.copy()
+    out["_sector"] = out["ticker"].map(sector_map)
+    out = out.dropna(subset=["_sector"])
+
+    neutral_col = f"{signal_col}_sector_neutral"
+    out[neutral_col] = out.groupby(["date", "_sector"])[signal_col].rank(
+        pct=True, method="average"
+    )
+
+    out = (
+        out.drop(columns=["_sector"])
+        .sort_values(["date", "ticker"])
+        .reset_index(drop=True)
+    )
+
+    logger.info(
+        "compute_sector_neutral_score: signal='%s', %d rows, %d dates",
+        signal_col,
+        len(out),
+        out["date"].nunique(),
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Week 5 Task 4 — Generalised functions for parameter sensitivity analysis
+# ---------------------------------------------------------------------------
+
+def compute_value_score_n(df: pd.DataFrame, lookback_months: int) -> pd.DataFrame:
+    """
+    Generalised value proxy score with an explicit, required lookback_months.
+
+    Thin wrapper around ``compute_value_score``; the only difference is that
+    ``lookback_months`` has no default, forcing callers to specify the window
+    explicitly.  ``lookback_months=12`` reproduces ``compute_value_score(df)``
+    output exactly (same monthly price grid, no skip month).
+
+    See ``compute_value_score`` for full parameter and return documentation.
+    """
+    return compute_value_score(df, lookback_months=lookback_months)
+
+
+def compute_momentum_score_n(df: pd.DataFrame, lookback_months: int) -> pd.DataFrame:
+    """
+    Generalised momentum score with an explicit, required lookback_months.
+
+    Always uses ``skip_months=1`` (the standard short-term reversal filter)
+    regardless of ``lookback_months``, so lookback is the only variable.
+    ``lookback_months=12`` reproduces ``compute_momentum_score(df)`` output
+    exactly (same monthly price grid, same 12-1 convention).
+
+    See ``compute_momentum_score`` for full parameter and return documentation.
+    """
+    return compute_momentum_score(df, lookback_months=lookback_months, skip_months=1)
+
+
+def get_rebalance_dates_freq(df: pd.DataFrame, freq: str) -> pd.DatetimeIndex:
+    """
+    Return rebalance dates derived from the trading calendar at a given frequency.
+
+    Parameters
+    ----------
+    df   : tidy daily OHLCV DataFrame (must contain ``date`` column)
+    freq : one of ``{"weekly", "monthly", "quarterly"}``
+
+            ``"weekly"``    — last trading day on or before each Friday.
+            ``"monthly"``   — identical to ``get_rebalance_dates(df)``.
+            ``"quarterly"`` — last trading day of each calendar quarter.
+
+    Returns
+    -------
+    pd.DatetimeIndex sorted ascending.
+    ``freq="monthly"`` is guaranteed to reproduce ``get_rebalance_dates(df)``
+    exactly.
+
+    Raises
+    ------
+    ValueError if ``freq`` is not in the allowed set.
+    """
+    _VALID = {"weekly", "monthly", "quarterly"}
+    if freq not in _VALID:
+        raise ValueError(f"freq must be one of {_VALID}; got {freq!r}")
+
+    if freq == "monthly":
+        return get_rebalance_dates(df)
+
+    # Resample the actual trading date sequence so holiday-adjusted dates are
+    # always real trading days (not calendar endpoints that may be non-trading).
+    trading_dates = pd.DatetimeIndex(sorted(df["date"].unique()))
+    # Anchor a Series on those dates; resample picks the last date in each bin.
+    temp = pd.Series(trading_dates, index=trading_dates)
+
+    if freq == "weekly":
+        # W-FRI: bins end on Friday; .last() → last trading day on/before that Friday
+        resampled = temp.resample("W-FRI").last().dropna()
+    else:  # "quarterly"
+        resampled = temp.resample("QE").last().dropna()
+
+    result = pd.DatetimeIndex(resampled.values).sort_values()
+    logger.info(
+        "get_rebalance_dates_freq: freq='%s', %d dates (%s → %s)",
+        freq,
+        len(result),
+        result.min().date(),
+        result.max().date(),
+    )
+    return result
+
+
+def form_ntile_portfolios(
+    df: pd.DataFrame,
+    signal_col: str,
+    ret_col: str,
+    n_groups: int,
+) -> pd.DataFrame:
+    """
+    Sort tickers into ``n_groups`` equal-sized portfolios at each rebalance date.
+
+    Generalises ``form_quintile_portfolios`` to arbitrary group counts.
+    ``n_groups=5`` reproduces ``form_quintile_portfolios`` output exactly
+    (same ``np.array_split`` bucketing, same descending-sort direction, same
+    equal-weighted average within each bucket).
+
+    Group numbering
+    ---------------
+    Group ``n_groups`` = highest signal = most desirable (long leg of LS).
+    Group 1 = lowest signal = least desirable (short leg of LS).
+    Long-short = group ``n_groups`` minus group 1.
+
+    Parameters
+    ----------
+    df         : tidy DataFrame with ``date``, ``ticker``, ``signal_col``,
+                 and ``ret_col`` columns.
+    signal_col : column to sort descending (higher = better).
+    ret_col    : forward holding-period return column.
+    n_groups   : number of equal-sized groups (e.g. 3=terciles, 5=quintiles,
+                 10=deciles).
+
+    Returns
+    -------
+    pd.DataFrame with columns: ``date, group, portfolio_return, n_holdings``.
+    Sorted by (date, group).
+    """
+    valid_mask = df.groupby("date")[ret_col].transform(lambda x: x.notna().all())
+    excluded_dates = sorted(df.loc[~valid_mask, "date"].unique())
+    if excluded_dates:
+        logger.info(
+            "form_ntile_portfolios: excluding %d date(s) with missing %s: %s",
+            len(excluded_dates),
+            ret_col,
+            [str(d.date()) for d in excluded_dates],
+        )
+
+    working = df[valid_mask & df[ret_col].notna()].copy()
+
+    records: list[dict] = []
+    for date, grp in working.groupby("date"):
+        sorted_grp = grp.sort_values(signal_col, ascending=False).reset_index(drop=True)
+        n = len(sorted_grp)
+        position_splits = np.array_split(np.arange(n), n_groups)
+
+        for g_idx, positions in enumerate(position_splits):
+            group = n_groups - g_idx   # first split (highest signal) → top group
+            bucket = sorted_grp.iloc[positions]
+            records.append({
+                "date":             date,
+                "group":            group,
+                "portfolio_return": bucket[ret_col].mean(),
+                "n_holdings":       len(bucket),
+            })
+
+    out = pd.DataFrame(records).sort_values(["date", "group"]).reset_index(drop=True)
+
+    logger.info(
+        "form_ntile_portfolios: %d rows (%d dates × %d groups) "
+        "using signal='%s', ret='%s'",
+        len(out),
+        out["date"].nunique(),
+        n_groups,
+        signal_col,
+        ret_col,
+    )
+    return out
